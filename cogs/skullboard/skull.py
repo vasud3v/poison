@@ -446,20 +446,18 @@ class Skullboard(commands.Cog):
             timestamp=message.created_at
         )
         embed.set_author(name=str(author), icon_url=author.display_avatar.url if author.display_avatar else None)
-        # title with message content or click to jump for media
+        # Show message content in description (not title) so mentions render properly
         has_media = bool(message.attachments)
         if message.content:
-            title_content = message.content[:100] + "..." if len(message.content) > 100 else message.content
-            embed.title = title_content
-            # Add clickable jump link below the message
-            embed.description = f"[Click to jump to message!]({message.jump_url})"
+            # Put content in description so mentions/formatting render properly
+            content_display = message.content[:2000] if len(message.content) > 2000 else message.content
+            embed.description = f"{content_display}\n\n[Click to jump to message!]({message.jump_url})"
         elif has_media:
             # For media posts, show Click to jump to message in description
             embed.description = f"[Click to jump to message!]({message.jump_url})"
         else:
             # No content and no media
-            embed.title = "_(no text)_"
-            embed.description = f"[Click to jump to message!]({message.jump_url})"
+            embed.description = f"_(no text)_\n\n[Click to jump to message!]({message.jump_url})"
         # attachments
         atts = message.attachments
         if atts:
