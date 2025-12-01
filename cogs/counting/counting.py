@@ -88,6 +88,7 @@ class CountingCog(commands.Cog):
         self.locks = {}            # guild_id -> asyncio.Lock
         self._dm_sent = {}         # (guild_id, user_id) -> timestamp
         self._last_lock_cleanup = time.time()
+        self._reset_cooldowns = {} # (guild_id, user_id) -> timestamp - prevent spam resets
         
         # Rate limit management
         self.deletion_queue = deque()  # Queue for message deletions
@@ -153,6 +154,12 @@ class CountingCog(commands.Cog):
             self._dm_sent = {
                 k: v for k, v in self._dm_sent.items() 
                 if current_time - v < DM_COOLDOWN_SECONDS * 2
+            }
+            
+            # Clean up reset cooldowns (keep last 1 hour)
+            self._reset_cooldowns = {
+                k: v for k, v in self._reset_cooldowns.items()
+                if current_time - v < 3600
             }
             
             # Clean up unused locks (guilds bot is no longer in)
@@ -342,14 +349,17 @@ class CountingCog(commands.Cog):
             else:
                 for i, (uid, cnt) in enumerate(top, start=1):
                     medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
-                    embed.add_field(name=f"{medal} <@{uid}>", value=f"{cnt} counts", inline=False)
+                    # Convert uid to int if it's a string (from MongoDB)
+                    user_id = int(uid) if isinstance(uid, str) else uid
+                    embed.add_field(name=f"{medal} <@{user_id}>", value=f"{cnt} counts", inline=False)
             await interaction.followup.send(embed=embed)
         else:
             # Show status info
             ch = interaction.guild.get_channel(doc.get("channel_id")) if doc.get("channel_id") else None
             last_user = interaction.guild.get_member(doc["last_user"]) if doc.get("last_user") else None
             top = sorted(doc.get("counts", {}).items(), key=lambda x: x[1], reverse=True)[:10]
-            lb = "\n".join([f"<@{uid}> — {cnt}" for uid, cnt in top]) or "No counts yet."
+            # Convert uid to int if it's a string (from MongoDB)
+            lb = "\n".join([f"<@{int(uid) if isinstance(uid, str) else uid}> — {cnt}" for uid, cnt in top]) or "No counts yet."
             
             embed = discord.Embed(title="📊 Counting Status", color=EMBED_COLOR)
             embed.add_field(name="Channel", value=(ch.mention if ch else "Not set"), inline=True)
@@ -456,6 +466,9 @@ class CountingCog(commands.Cog):
             if set_number <= 0:
                 await interaction.response.send_message("Number must be positive (1 or greater).", ephemeral=True)
                 return
+            if set_number > 1_000_000_000:
+                await interaction.response.send_message("Number is too large (max: 1 billion).", ephemeral=True)
+                return
             updates["current"] = set_number - 1
             updates["last_user"] = None
             messages.append(f"✓ Count set! Next number should be **{set_number}**")
@@ -488,13 +501,51 @@ class CountingCog(commands.Cog):
             color=EMBED_COLOR
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+    
+    @count_group.command(name="banned", description="View list of banned users")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def banned_list(self, interaction: discord.Interaction):
+        """View all users banned from counting"""
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        doc = await self._get_or_create(interaction.guild.id)
+        
+        banned = doc.get("banned", [])
+        if not banned:
+            embed = discord.Embed(
+                title="🚫 Banned Users",
+                description="No users are currently banned from counting.",
+                color=EMBED_COLOR
+            )
+        else:
+            embed = discord.Embed(
+                title="🚫 Banned Users",
+                description=f"**{len(banned)}** user(s) banned from counting:",
+                color=EMBED_COLOR
+            )
+            
+            # Show up to 25 banned users (Discord embed field limit)
+            for i, uid in enumerate(banned[:25], start=1):
+                user = interaction.guild.get_member(uid)
+                user_str = f"{user.mention} ({user})" if user else f"<@{uid}> (User left)"
+                embed.add_field(name=f"#{i}", value=user_str, inline=False)
+            
+            if len(banned) > 25:
+                embed.set_footer(text=f"Showing 25 of {len(banned)} banned users")
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
     # ---------- Logging helper ----------
     async def _log(self, guild_id: int, message: str):
         """Send log message to configured log channel"""
         try:
-            doc = await self.coll.find_one({"guild_id": guild_id}, {"log_channel_id": 1})
+            async with self.db_semaphore:
+                doc = await self.coll.find_one({"guild_id": guild_id}, {"log_channel_id": 1})
+            
             if doc and doc.get("log_channel_id"):
                 ch = self.bot.get_channel(doc["log_channel_id"])
                 if ch:
@@ -518,11 +569,12 @@ class CountingCog(commands.Cog):
 
         guild_id = message.guild.id
         
-        # Get config (lightweight query)
-        doc = await self.coll.find_one(
-            {"guild_id": guild_id}, 
-            {"channel_id": 1, "banned": 1, "current": 1, "last_user": 1, "emoji": 1, "record": 1}
-        )
+        # Get config (lightweight query with semaphore)
+        async with self.db_semaphore:
+            doc = await self.coll.find_one(
+                {"guild_id": guild_id}, 
+                {"channel_id": 1, "banned": 1, "current": 1, "last_user": 1, "emoji": 1, "record": 1}
+            )
         
         if not doc or not doc.get("channel_id"):
             return
@@ -538,11 +590,16 @@ class CountingCog(commands.Cog):
         
         perms = channel.permissions_for(message.guild.me)
         if not (perms.manage_messages and perms.add_reactions):
+            # Log permission issue once per hour to avoid spam
+            log_key = f"perm_warn_{guild_id}"
+            current_time = time.time()
+            if log_key not in self._dm_sent or current_time - self._dm_sent.get(log_key, 0) > 3600:
+                await self._log(
+                    guild_id,
+                    f"⚠️ Missing permissions in counting channel! I need: Manage Messages, Add Reactions"
+                )
+                self._dm_sent[log_key] = current_time
             return
-
-        # Ensure lock exists
-        if guild_id not in self.locks:
-            self.locks[guild_id] = asyncio.Lock()
 
         # Check banned users
         banned = set(doc.get("banned", []))
@@ -564,28 +621,64 @@ class CountingCog(commands.Cog):
                     pass
             return
 
-        # Multi-number detection
+        # Multi-number detection (e.g., "1 2 3" or "123 456")
         numbers_found = NUMBER_ANY_RE.findall(message.content)
         if len(numbers_found) > 1:
             self.queue_deletion(message, "multi_number")
-            await self._log(guild_id, f"<:alert:1426440385269338164> Multi-number message from {message.author} deleted.")
+            # Don't log every multi-number to avoid spam
             return
 
-        # Pure integer only
-        if not PURE_INT_RE.match(message.content.strip()):
+        # Pure integer only (no text, no decimals, no special chars)
+        content_stripped = message.content.strip()
+        
+        # Remove ALL whitespace and invisible characters
+        # This handles: spaces, tabs, zero-width spaces, BOM, RTL marks, etc.
+        content_cleaned = ''.join(c for c in content_stripped if c.isdigit())
+        
+        if not PURE_INT_RE.match(content_cleaned):
             self.queue_deletion(message, "invalid_format")
+            return
+        
+        # Check for leading zeros (e.g., "007" should be rejected)
+        if len(content_cleaned) > 1 and content_cleaned[0] == '0':
+            self.queue_deletion(message, "leading_zeros")
+            return
+        
+        # Check for excessively long number strings (prevent DoS)
+        if len(content_cleaned) > 15:  # 1 quadrillion has 16 digits, we limit to 1 billion anyway
+            self.queue_deletion(message, "number_too_long")
             return
 
         # Parse number
         try:
-            num = int(message.content.strip())
-        except ValueError:
+            num = int(content_cleaned)
+        except (ValueError, OverflowError):
             self.queue_deletion(message, "parse_error")
             return
+        
+        # Validate positive number and reasonable range
+        if num <= 0:
+            self.queue_deletion(message, "non_positive_number")
+            return
+        
+        # Prevent extremely large numbers (max 1 billion)
+        if num > 1_000_000_000:
+            self.queue_deletion(message, "number_too_large")
+            return
 
-        # Acquire per-guild lock
-        async with self.locks[guild_id]:
-            # Use cached values from initial query
+        # Acquire per-guild lock (create if doesn't exist atomically)
+        lock = self.locks.setdefault(guild_id, asyncio.Lock())
+        
+        async with lock:
+            # Re-fetch current state inside the lock to prevent race conditions
+            async with self.db_semaphore:
+                doc = await self.coll.find_one(
+                    {"guild_id": guild_id}, 
+                    {"current": 1, "last_user": 1, "emoji": 1, "record": 1}
+                )
+            if not doc:
+                return
+            
             current = doc.get("current", 0)
             expected = current + 1
             last_user = doc.get("last_user")
@@ -593,6 +686,8 @@ class CountingCog(commands.Cog):
 
             # Check same user twice in a row
             if last_user and last_user == message.author.id:
+                # Queue deletion first to ensure it happens
+                self.queue_deletion(message, "same_user_twice")
                 try:
                     await self.safe_add_reaction(message, CROSS_EMOJI_CUSTOM)
                     await asyncio.sleep(0.3)
@@ -603,7 +698,6 @@ class CountingCog(commands.Cog):
                     warning_msg = await message.channel.send(embed=embed)
                     # Delete warning message after 3 seconds to prevent stacking
                     asyncio.create_task(self._delete_after(warning_msg, 3))
-                    self.queue_deletion(message, "same_user_twice")
                 except Exception as e:
                     logging.error(f"Same user error handling: {e}")
                 await self._log(guild_id, f"<:ogs_info:1427918257226121288> {message.author} tried counting twice ({num}).")
@@ -611,6 +705,20 @@ class CountingCog(commands.Cog):
 
             # Check wrong number
             if num != expected:
+                # Check for spam reset cooldown (10 seconds per user)
+                reset_key = (guild_id, message.author.id)
+                current_time = time.time()
+                last_reset = self._reset_cooldowns.get(reset_key, 0)
+                
+                if current_time - last_reset < 10:
+                    # User is spamming resets, just delete silently
+                    self.queue_deletion(message, "reset_spam")
+                    return
+                
+                self._reset_cooldowns[reset_key] = current_time
+                
+                # Queue deletion first to ensure it happens even if error occurs
+                self.queue_deletion(message, "wrong_number")
                 try:
                     await self.safe_add_reaction(message, CROSS_EMOJI_CUSTOM)
                     await asyncio.sleep(0.3)
@@ -690,12 +798,13 @@ class CountingCog(commands.Cog):
             await self.safe_add_reaction(message, success_emoji)
 
             # Announce new record (multiples of 100)
-            old_record = doc.get("record", 0)
-            new_record = res.get("record", 0)
-            if new_record > old_record and new_record % 100 == 0:
+            old_record = doc.get("record", 0)  # Record before this update
+            new_record = res.get("record", 0)  # Record after this update
+            # Only announce if this is a NEW record milestone
+            if new_record > old_record and num % 100 == 0 and num > 0:
                 try:
                     await message.channel.send(
-                        f" **New Record!** The count has reached **{new_record}**! "
+                        f"🎉 **New Record Milestone!** The count has reached **{num}**! "
                     )
                 except Exception:
                     pass
@@ -710,11 +819,12 @@ class CountingCog(commands.Cog):
         if not after.guild or after.author.bot:
             return
         
-        # Check if in counting channel
-        doc = await self.coll.find_one(
-            {"guild_id": after.guild.id}, 
-            {"channel_id": 1}
-        )
+        # Check if in counting channel (use semaphore)
+        async with self.db_semaphore:
+            doc = await self.coll.find_one(
+                {"guild_id": after.guild.id}, 
+                {"channel_id": 1}
+            )
         
         if doc and doc.get("channel_id") == after.channel.id:
             self.queue_deletion(after, "edited_message")
@@ -722,6 +832,55 @@ class CountingCog(commands.Cog):
                 after.guild.id, 
                 f"<:ogs_bell:1427918360401940552> Deleted edited message from {after.author} (anti-cheat)."
             )
+
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.TextChannel):
+        """Handle counting channel deletion"""
+        try:
+            # Check if this was a counting channel
+            async with self.db_semaphore:
+                doc = await self.coll.find_one(
+                    {"guild_id": channel.guild.id, "channel_id": channel.id}
+                )
+            
+            if doc:
+                # Clear the counting channel setting
+                await self.upsert_fields(channel.guild.id, {"channel_id": None})
+                logging.info(f"Counting channel deleted in guild {channel.guild.id}, cleared setting")
+                
+                # Try to log to log channel if it exists
+                await self._log(
+                    channel.guild.id,
+                    f"⚠️ Counting channel was deleted. Use `/count settings` to set a new one."
+                )
+        except Exception as e:
+            logging.error(f"Error handling channel deletion: {e}")
+
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild):
+        """Clean up when bot is removed from a guild"""
+        try:
+            # Clean up caches
+            self.banned_cache.pop(guild.id, None)
+            self.locks.pop(guild.id, None)
+            
+            # Clean up DM sent cache for this guild
+            self._dm_sent = {
+                k: v for k, v in self._dm_sent.items() 
+                if k[0] != guild.id
+            }
+            
+            # Clean up reset cooldowns for this guild
+            self._reset_cooldowns = {
+                k: v for k, v in self._reset_cooldowns.items()
+                if k[0] != guild.id
+            }
+            
+            logging.info(f"Cleaned up caches for guild {guild.id} ({guild.name})")
+        except Exception as e:
+            logging.error(f"Error cleaning up guild {guild.id}: {e}")
 
 
     async def cog_unload(self):
@@ -733,14 +892,19 @@ class CountingCog(commands.Cog):
         self.cache_cleanup_loop.cancel()
         self.deletion_worker.cancel()
         
-        # Process remaining deletions
+        # Process remaining deletions (limit to 50 to avoid timeout)
         logging.info(f"Processing {len(self.deletion_queue)} remaining deletions...")
-        while self.deletion_queue and len(self.deletion_queue) < 50:
+        processed = 0
+        while self.deletion_queue and processed < 50:
             message, reason = self.deletion_queue.popleft()
             try:
                 await message.delete()
+                processed += 1
             except Exception:
                 pass
+        
+        if self.deletion_queue:
+            logging.warning(f"Skipped {len(self.deletion_queue)} deletions due to unload timeout")
         
         # Close MongoDB connection only if we own it
         if self._owns_connection:
